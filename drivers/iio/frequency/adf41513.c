@@ -8,6 +8,7 @@
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
@@ -252,6 +253,8 @@ struct adf41513_state {
 	struct gpio_desc *lock_detect;
 	struct gpio_desc *chip_enable;
 	struct clk *ref_clk;
+	struct clk *clk_out;
+	struct clk_hw clk_hw;
 
 	u64 ref_freq_hz;
 
@@ -280,6 +283,8 @@ struct adf41513_state {
 	 */
 	__be32 buf __aligned(IIO_DMA_MINALIGN);
 };
+
+#define to_adf41513_state(_hw) container_of(_hw, struct adf41513_state, clk_hw)
 
 static const u16 adf41513_ld_window_p1ns[] = {
 	9, 12, 16, 17, 21, 28, 29, 35,			/* 0 - 7 */
@@ -1126,6 +1131,148 @@ static const struct iio_info adf41513_info = {
 	.debugfs_reg_access = &adf41513_reg_access,
 };
 
+static void adf41513_clk_del_provider(void *data)
+{
+	struct adf41513_state *st = data;
+
+	of_clk_del_provider(st->spi->dev.of_node);
+}
+
+static unsigned long adf41513_clk_recalc_rate(struct clk_hw *hw,
+					      unsigned long parent_rate)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+
+	guard(mutex)(&st->lock);
+	return div_u64(adf41513_pll_get_rate(st), MICROHZ_PER_HZ);
+}
+
+static long adf41513_clk_round_rate(struct clk_hw *hw,
+				    unsigned long rate,
+				    unsigned long *parent_rate)
+{
+	return rate;
+}
+
+static int adf41513_clk_set_rate(struct clk_hw *hw,
+				 unsigned long rate,
+				 unsigned long parent_rate)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+	u64 freq_uhz = (u64)rate * MICROHZ_PER_HZ;
+
+	if (parent_rate < ADF41513_MIN_REF_FREQ ||
+	    parent_rate > ADF41513_MAX_REF_FREQ)
+		return -EINVAL;
+
+	guard(mutex)(&st->lock);
+	st->ref_freq_hz = parent_rate;
+	return adf41513_set_frequency(st, freq_uhz, ADF41513_SYNC_DIFF);
+}
+
+static int adf41513_clk_prepare(struct clk_hw *hw)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+
+	guard(mutex)(&st->lock);
+	return adf41513_resume(st);
+}
+
+static void adf41513_clk_unprepare(struct clk_hw *hw)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+
+	guard(mutex)(&st->lock);
+	adf41513_suspend(st);
+}
+
+static int adf41513_clk_is_enabled(struct clk_hw *hw)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+
+	guard(mutex)(&st->lock);
+	return (st->regs_hw[ADF41513_REG6] & ADF41513_REG6_POWER_DOWN_MSK) == 0;
+}
+
+static int adf41513_clk_get_phase(struct clk_hw *hw)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+	u32 phase_val;
+
+	phase_val = FIELD_GET(ADF41513_REG2_PHASE_VAL_MSK, st->regs_hw[ADF41513_REG2]);
+	return DIV_ROUND_CLOSEST(360 * phase_val, BIT(12));
+}
+
+static int adf41513_clk_set_phase(struct clk_hw *hw, int degrees)
+{
+	struct adf41513_state *st = to_adf41513_state(hw);
+	u32 phase_val;
+
+	degrees %= 360;
+	if (degrees < 0)
+		degrees += 360;
+	phase_val = DIV_ROUND_CLOSEST(degrees << 12, 360);
+
+	guard(mutex)(&st->lock);
+
+	st->regs[ADF41513_REG2] |= ADF41513_REG2_PHASE_ADJ_MSK;
+	st->regs[ADF41513_REG2] &= ~ADF41513_REG2_PHASE_VAL_MSK;
+	st->regs[ADF41513_REG2] |= FIELD_PREP(ADF41513_REG2_PHASE_VAL_MSK, phase_val);
+	return adf41513_sync_config(st, ADF41513_SYNC_REG0);
+}
+
+static const struct clk_ops adf41513_clk_ops = {
+	.recalc_rate = adf41513_clk_recalc_rate,
+	.round_rate = adf41513_clk_round_rate,
+	.set_rate = adf41513_clk_set_rate,
+	.prepare = adf41513_clk_prepare,
+	.unprepare = adf41513_clk_unprepare,
+	.is_enabled = adf41513_clk_is_enabled,
+	.get_phase = adf41513_clk_get_phase,
+	.set_phase = adf41513_clk_set_phase,
+};
+
+static int adf41513_clk_register(struct adf41513_state *st)
+{
+	struct spi_device *spi = st->spi;
+	struct clk_init_data init;
+	struct clk *clk = NULL;
+	const char *parent_name;
+	int ret;
+
+	if (!device_property_present(&spi->dev, "#clock-cells"))
+		return 0;
+
+	if (device_property_read_string(&spi->dev, "clock-output-names", &init.name)) {
+		init.name = devm_kasprintf(&spi->dev, GFP_KERNEL, "%s-clk",
+					   fwnode_get_name(dev_fwnode(&spi->dev)));
+		if (!init.name)
+			return -ENOMEM;
+	}
+
+	parent_name = of_clk_get_parent_name(spi->dev.of_node, 0);
+	if (!parent_name)
+		return -EINVAL;
+
+	init.ops = &adf41513_clk_ops;
+	init.parent_names = &parent_name;
+	init.num_parents = 1;
+	init.flags = CLK_SET_RATE_PARENT;
+
+	st->clk_hw.init = &init;
+	clk = devm_clk_register(&spi->dev, &st->clk_hw);
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+
+	ret = of_clk_add_provider(spi->dev.of_node, of_clk_src_simple_get, clk);
+	if (ret)
+		return ret;
+
+	st->clk_out = clk;
+
+	return devm_add_action_or_reset(&spi->dev, adf41513_clk_del_provider, st);
+}
+
 static int adf41513_parse_fw(struct adf41513_state *st)
 {
 	struct device *dev = &st->spi->dev;
@@ -1343,6 +1490,10 @@ static int adf41513_probe(struct spi_device *spi)
 	ret = adf41513_setup(st);
 	if (ret < 0)
 		return dev_err_probe(&spi->dev, ret, "failed to setup device: %d\n", ret);
+
+	ret = adf41513_clk_register(st);
+	if (ret < 0)
+		return dev_err_probe(&spi->dev, ret, "failed to register clock: %d\n", ret);
 
 	ret = devm_add_action_or_reset(&spi->dev, adf41513_power_down, st);
 	if (ret)
